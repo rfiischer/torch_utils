@@ -3,7 +3,7 @@ import torch.nn as nn
 import re 
 from collections import OrderedDict
 
-from utils import get_class
+from .utils import get_class
 
 
 class Freeze:
