@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import re 
 from collections import OrderedDict
+import operator
+from itertools import accumulate
+import numpy as np
 
 from .utils import get_class
 
@@ -66,7 +69,7 @@ class ParallelNet(nn.Module):
     def forward(self, x):
         outputs = []
         for model, _ in self._branches:
-            outputs.append(model.forward(x))
+            outputs.append(model(x))
 
         # Now concatenate
         return torch.cat(outputs, dim=self._dim)
@@ -122,6 +125,190 @@ class SurrogateNet(nn.Module):
         return out
 
 
+def unfold(tensor, kernel_size, stride, dilation):
+    """
+    Unfold a tensor's last dimensions using a kernel with kernel_size and stride (both are tuples)
+    """
+    # To better understand this code, think that the spacial dimensions of the input tensor are stored in memory linearly as a flattened array 
+    # Then, to get the patches with kernel_size, we have to convert the kernel_size shape into a non-contiguous flattened kernel 
+    n_dims = len(kernel_size)   # Number of dimensions to unfold 
+
+    volumes = list(accumulate((1,) + tensor.shape[:0:-1], operator.mul))[::-1]  # Volumes of each dimension 
+
+    final_shape = list(tensor.shape[:-n_dims])  # Keep non-spacial shapes
+    final_shape.extend((-1,) + kernel_size)     # Leave the number of kernel positions blank (-1)
+
+    final_strides = volumes[:-n_dims]           # For the non-spacial dimensions, the strides are the volumes 
+    final_strides.append(1)                     # First move the kernel by 1 element on the linearized memory 
+    final_strides.extend([x * y for x, y in zip(volumes[-n_dims:], dilation)])
+
+    size_per_dim = [(x-1) * y for x, y in zip(final_shape[-n_dims:], final_strides[-n_dims:])]  # This is how many memory elements each kernel dimension needs 
+    kernel_memory = sum(size_per_dim) + 1   # This is how many memory elements the kernel spans in total (non-contiguous)
+
+    length = volumes[-n_dims - 1] - kernel_memory + 1     # Simple formula for the flattened kernel 
+
+    final_shape[-n_dims - 1] = length
+
+    unfolded_tensor = tensor.as_strided(final_shape, final_strides)
+
+    # We now remove the positions corresponding to the kernels wrapping around the edges 
+    start_indexes = np.arange(0, length)
+    valid_indexes = np.ones(length)
+    for dim in range(-1, -n_dims, -1):
+        valid_indexes = np.logical_and(valid_indexes, (start_indexes % volumes[dim - 1]) + size_per_dim[dim] + 1 <= volumes[dim - 1])
+
+    # Finally, we apply the 'convolution' stride
+    for dim in range(-1, -n_dims - 1, -1):
+        valid_indexes = np.logical_and(valid_indexes, ((start_indexes % volumes[dim - 1]) // volumes[dim]) % stride[dim] == 0)
+    
+    indexing = [slice(None)] * unfolded_tensor.ndim 
+    indexing[-n_dims - 1] = valid_indexes
+    
+    return unfolded_tensor[indexing]
+
+
+class ConvLike:
+    """
+    Provides helper methods to unfold tensors into a way compatible with some models such as GRUs
+    """
+    def __init__(self, in_channels, kernel_size, stride=1, dilation=1):
+        self.in_channels = in_channels
+        self.kernel_size = (kernel_size,) if type(kernel_size) is int else kernel_size
+        self.ndim = len(self.kernel_size)
+        self.stride = (stride,) * self.ndim if type(stride) is int else stride
+        self.dilation = (dilation,) * self.ndim if type(dilation) is int else dilation
+        self.effective_size = tuple((k - 1) * d + 1 for k, d in zip(self.kernel_size, self.dilation))
+
+    def unfold(self, x):
+        x = unfold(x, self.kernel_size, self.stride, self.dilation)
+        x = torch.transpose(x, -self.ndim - 1, -self.ndim - 2)  # Transpose the input channel dimension with the sequence index dimension  
+        x = x.flatten(start_dim=-self.ndim - 1, end_dim=-1) # Flatten the input channel dimensions along with the spacial ones
+        return x
+    
+    def forward(self, x):
+        new_sizes = tuple((shape - e) // s + 1 for shape, e, s in zip(x.shape[-self.ndim:], self.effective_size, self.stride))
+        x = self.unfold(x)
+        x = super().forward(x)  # Call the forward method of the class above this one in the MRO
+        x = torch.transpose(x, -1, -2) # Put the channel dimension back in it's place 
+        return x.reshape(x.shape[:-1] + new_sizes)
+    
+
+def get_padding(module, padding=None, ndim=1):
+    """
+    Computes the padding necessary to have an output of L / s, where L is the sequence size and s is the stride, of a convolution layer, assuming L is divisible by s. A negative right padding means that for the last stride the kernel doesn't cover the entire input
+    """
+    if hasattr(module, 'get_padding'):
+        return module.get_padding(padding)
+    
+    elif hasattr(module, 'kernel_size') and hasattr(module, 'stride') and hasattr(module, 'dilation'):
+        kernel_size = module.kernel_size
+        stride = module.stride
+        dilation = module.dilation
+        effective_size = tuple((k - 1) * d + 1 for k, d in zip(kernel_size, dilation))
+        return tuple(
+            p for e_size, stride in zip(effective_size, stride) 
+                for p in ((e_size - 1) // 2, (e_size + 1) // 2 - stride)    # Left and right padding for each dimension 
+            )
+
+    else:
+        return (0,) * (2 * ndim)
+
+
+def get_stride(module, ndim=1):
+    if hasattr(module, 'get_stride'):
+        return module.get_stride()
+    
+    elif hasattr(module, 'stride'):
+        return module.stride
+    
+    else:
+        return (1,) * ndim
+
+
+class SequentialConv(SequentialNet):
+    """
+    A SequentialNet with special methods for a convolutional structure
+    """
+    def __init__(self, *args, ndim=1, **kwargs):
+        SequentialNet.__init__(self, *args, **kwargs)
+        self.ndim = ndim
+
+    def get_padding(self, padding=None):
+        if padding is None:
+            padding = (0,) * (2 * self.ndim)
+
+        layer_list = list(self.children())
+
+        for layer in layer_list[::-1]:
+            own_padding = get_padding(layer, padding, self.ndim)
+            stride = get_stride(layer, self.ndim)
+            padding = tuple(
+                p for dim_idx, (l, r) in enumerate(zip(padding[::2], padding[1::2]))
+                    for p in (
+                        l * stride[dim_idx] + own_padding[2 * dim_idx],
+                        r * stride[dim_idx] + own_padding[2 * dim_idx + 1]
+                    )
+                )
+
+        return padding
+    
+    def get_stride(self):
+        stride = (1,) * self.ndim
+        for layer in self.children():
+            own_stride = get_stride(layer)
+            stride = tuple(x * y for x, y in zip(stride, own_stride))
+        
+        return stride
+    
+
+class ParallelConv(ParallelNet):
+    def __init__(self, *args, ndim=1, **kwargs):
+        ParallelNet.__init__(self, *args, **kwargs)
+        self.ndim = ndim
+        self.padding_list = []
+        self.padding = None
+        self.padding_slices = []
+
+    def get_padding(self, padding=None):
+        for layer in self.children():
+            own_padding = get_padding(layer, padding, self.ndim)
+            self.padding_list.append(own_padding)
+    
+        self.padding = (max([x[0] for x in self.padding_list]), max([x[1] for x in self.padding_list]))
+
+        for branch_padding in self.padding_list:
+            slice_list = [...]
+            for dim_idx in range(len(branch_padding) // 2):
+                slice_list.append(slice(self.padding[0] - branch_padding[2 * dim_idx], -(self.padding[1] - branch_padding[2 * dim_idx + 1]) or None))
+            
+            self.padding_slices.append(slice_list)
+
+        return self.padding
+    
+    def get_stride(self):
+        return get_stride(self._branches[0][0])
+    
+    def forward(self, x):
+        outputs = []
+        for idx, (model, _) in enumerate(self._branches):
+            outputs.append(model(x[self.padding_slices[idx]]))
+
+        # Now concatenate
+        return torch.cat(outputs, dim=self._dim)
+
+
+class SurrogateConv(SurrogateNet):
+    def __init__(self, *args, ndim=1, **kwargs):
+        SurrogateNet.__init__(self, *args, **kwargs)
+        self.ndim = ndim
+    
+    def get_padding(self, padding=None):
+        return get_padding(self.main, padding, self.ndim)
+    
+    def get_stride(self):
+        return get_stride(self.main, self.ndim)
+            
+    
 # Used to process the parameters of a torch.nn.Module
 def process_parameters(module, config, device='cpu', accumulate=False):
     """
