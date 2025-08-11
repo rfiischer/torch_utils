@@ -56,10 +56,11 @@ class ParallelNet(nn.Module):
     """
     Concatenate the outputs of multiple models at the desired dimension 
     """
-    def __init__(self, config, dim=1):
+    def __init__(self, config, dim=1, mode='cat'):
         super().__init__()
         self._branches = []
         self._dim = dim
+        self.mode = mode
         for layer_name, layer_conf in config.items():
             model = get_class(layer_conf['model'])
             model = model(**layer_conf['kwargs'])
@@ -72,7 +73,10 @@ class ParallelNet(nn.Module):
             outputs.append(model(x))
 
         # Now concatenate
-        return torch.cat(outputs, dim=self._dim)
+        if self.mode == 'cat':
+            return torch.cat(outputs, dim=self._dim)
+        else:
+            return sum(outputs)
     
     def __getitem__(self, key):
         return self._branches[key][0]
@@ -85,11 +89,25 @@ class ParallelNet(nn.Module):
         return len(self._branches)
 
 
+def hook_factory(x, surrogate, surrogate_is_grad=False):
+    if surrogate_is_grad:
+        def hook(grad):
+            x.backward(surrogate(x) * grad) # Only makes sense in the case a function is applied element-wise on x (Jacobian is then a diagonal)
+
+    else:
+        surrogate_output = surrogate(x)
+
+        def hook(grad):
+            surrogate_output.backward(grad)
+    
+    return hook
+
+
 class SurrogateNet(nn.Module):
     """
     Use one net for the forward pass, and another for the backward 
     """
-    def __init__(self, config, clone_model=True):
+    def __init__(self, config, clone_model=True, surrogate_is_grad=False):
         nn.Module.__init__(self)
         
         for (_, layer_conf), layer_name in zip(list(config.items())[:2], ['main', 'surrogate']):   # Only two layers are processed 
@@ -100,6 +118,7 @@ class SurrogateNet(nn.Module):
         if clone_model:
             clone(self.main, self.surrogate)
 
+        self.surrogate_is_grad = surrogate_is_grad
         self.surrogate_output = None
         
     def forward(self, x):
@@ -113,13 +132,10 @@ class SurrogateNet(nn.Module):
         #        \              /  (connection created through hook)
         #          <-- surr <--
 
-        self.surrogate_output = self.surrogate(x)
         with torch.no_grad():
             out = self.main(x).requires_grad_(True)
         
-        def hook(grad):
-            self.surrogate_output.backward(grad)
-        
+        hook = hook_factory(x, self.surrogate, self.surrogate_is_grad)
         out.register_hook(hook)
         
         return out
@@ -271,7 +287,7 @@ class ParallelConv(ParallelNet):
 
     def get_padding(self, padding=None):
         for layer in self.children():
-            own_padding = get_padding(layer, padding, self.ndim)
+            own_padding = get_padding(layer, padding=None, ndim=self.ndim)
             self.padding_list.append(own_padding)
     
         self.padding = (max([x[0] for x in self.padding_list]), max([x[1] for x in self.padding_list]))
@@ -294,7 +310,10 @@ class ParallelConv(ParallelNet):
             outputs.append(model(x[self.padding_slices[idx]]))
 
         # Now concatenate
-        return torch.cat(outputs, dim=self._dim)
+        if self.mode == 'cat':
+            return torch.cat(outputs, dim=self._dim)
+        else:
+            return sum(outputs)
 
 
 class SurrogateConv(SurrogateNet):
@@ -303,7 +322,8 @@ class SurrogateConv(SurrogateNet):
         self.ndim = ndim
     
     def get_padding(self, padding=None):
-        return get_padding(self.main, padding, self.ndim)
+        get_padding(self.surrogate, padding=None, ndim=self.ndim)
+        return get_padding(self.main, padding=None, ndim=self.ndim)
     
     def get_stride(self):
         return get_stride(self.main, self.ndim)
