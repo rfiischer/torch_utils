@@ -223,7 +223,7 @@ def get_padding(module, padding=None, ndim=1):
         effective_size = tuple((k - 1) * d + 1 for k, d in zip(kernel_size, dilation))
         return tuple(
             p for e_size, stride in zip(effective_size, stride) 
-                for p in ((e_size - 1) // 2, (e_size + 1) // 2 - stride)    # Left and right padding for each dimension 
+                for p in ((e_size - 1) // 2, e_size - (e_size - 1) // 2 - stride)    # Left and right padding for each dimension 
             )
 
     else:
