@@ -180,7 +180,7 @@ def unfold(tensor, kernel_size, stride, dilation):
     indexing = [slice(None)] * unfolded_tensor.ndim 
     indexing[-n_dims - 1] = valid_indexes
     
-    return unfolded_tensor[indexing]
+    return unfolded_tensor[tuple(indexing)]
 
 
 class ConvLike:
