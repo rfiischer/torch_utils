@@ -307,7 +307,7 @@ class ParallelConv(ParallelNet):
     def forward(self, x):
         outputs = []
         for idx, (model, _) in enumerate(self._branches):
-            outputs.append(model(x[tuple(self.padding_slices[idx]])))
+            outputs.append(model(x[tuple(self.padding_slices[idx])]))
 
         # Now concatenate
         if self.mode == 'cat':
