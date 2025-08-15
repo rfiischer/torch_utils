@@ -370,6 +370,21 @@ def clone(modelA, modelB):
         parameters(modelB, name, param)
 
 
+# Computes the number of bytes used by the model 
+def memory_size(model, keywords=('weight', 'bias')):
+    memory = {keyword: 0 for keyword in keywords}
+    memory['other'] = 0
+    for layer in model.children():
+        for name, param in layer.named_parameters():
+            for keyword in keywords:
+                if keyword in name:
+                    memory[keyword] += param.numel() * param.element_size()
+                else:
+                    memory['other'] += param.numel() * param.element_size()
+
+    return memory
+
+
 def entropy_reg(param, factor=0.1):
     param = torch.abs(param)
     param = param / torch.sum(param)
