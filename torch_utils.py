@@ -209,12 +209,12 @@ class ConvLike:
         return x.reshape(x.shape[:-1] + new_sizes)
     
 
-def get_padding(module, padding=None, ndim=1):
+def get_padding(module, ndim=1):
     """
     Computes the padding necessary to have an output of L / s, where L is the sequence size and s is the stride, of a convolution layer, assuming L is divisible by s. A negative right padding means that for the last stride the kernel doesn't cover the entire input
     """
     if hasattr(module, 'get_padding'):
-        return module.get_padding(padding)
+        return module.get_padding()
     
     elif hasattr(module, 'kernel_size') and hasattr(module, 'stride') and hasattr(module, 'dilation'):
         kernel_size = module.kernel_size
@@ -249,14 +249,13 @@ class SequentialConv(SequentialNet):
         SequentialNet.__init__(self, *args, **kwargs)
         self.ndim = ndim
 
-    def get_padding(self, padding=None):
-        if padding is None:
-            padding = (0,) * (2 * self.ndim)
+    def get_padding(self):
+        padding = (0,) * (2 * self.ndim)
 
         layer_list = list(self.children())
 
         for layer in layer_list[::-1]:
-            own_padding = get_padding(layer, padding, self.ndim)
+            own_padding = get_padding(layer, self.ndim)
             stride = get_stride(layer, self.ndim)
             padding = tuple(
                 p for dim_idx, (l, r) in enumerate(zip(padding[::2], padding[1::2]))
@@ -285,9 +284,9 @@ class ParallelConv(ParallelNet):
         self.padding = None
         self.padding_slices = []
 
-    def get_padding(self, padding=None):
+    def get_padding(self):
         for layer in self.children():
-            own_padding = get_padding(layer, padding=None, ndim=self.ndim)
+            own_padding = get_padding(layer, ndim=self.ndim)
             self.padding_list.append(own_padding)
     
         self.padding = (max([x[0] for x in self.padding_list]), max([x[1] for x in self.padding_list]))
@@ -321,9 +320,9 @@ class SurrogateConv(SurrogateNet):
         SurrogateNet.__init__(self, *args, **kwargs)
         self.ndim = ndim
     
-    def get_padding(self, padding=None):
-        get_padding(self.surrogate, padding=None, ndim=self.ndim)
-        return get_padding(self.main, padding=None, ndim=self.ndim)
+    def get_padding(self):
+        get_padding(self.surrogate, ndim=self.ndim)
+        return get_padding(self.main, ndim=self.ndim)
     
     def get_stride(self):
         return get_stride(self.main, self.ndim)
