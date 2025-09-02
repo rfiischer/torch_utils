@@ -5,8 +5,9 @@ from collections import OrderedDict
 import operator
 from itertools import accumulate
 import numpy as np
+from itertools import combinations
 
-from .utils import get_class
+from .utils import get_class, num_volterra
 
 
 class Freeze:
@@ -327,6 +328,116 @@ class SurrogateConv(SurrogateNet):
     def get_stride(self):
         return get_stride(self.main, self.ndim)
             
+
+class Volterra(nn.Module):
+    """
+    Creates the features combining different time steps. Combine this with ConvLike.
+    For order=1, use Conv1d instead.
+    """
+    def __init__(self, order, memory, valid_indexes=None):
+        self.order = order
+        self.memory = memory
+        if valid_indexes is not None and type(valid_indexes) is list:
+            self.valid_indexes = valid_indexes
+        else:
+            self.valid_indexes = list(range(num_volterra(order, memory)))
+
+        self.num_features = len(self.valid_indexes)
+        nn.Module.__init__(self)
+
+    def forward(self, x):
+        # Assume x has shape (N, L, M), with N batch size, L the number of sequences, and M the memory size
+        output = x.new_zeros(x.shape[:-1] + (0,), requires_grad=x.requires_grad)
+        if self.memory == 0:
+            return output
+        
+        else:
+            if self.order > 1:
+                for idx, c in enumerate(combinations(range(self.order + self.memory - 1), self.memory - 1)): # Stars and bars combinatorics 
+                    if idx in self.valid_indexes:
+                        powers = [b - a - 1 for a, b in zip((-1,) + c, c + (self.order + self.memory - 1,))]    # The difference between two bars (minus 1) is the number of elements 
+                        start = False
+                        for idx, power in enumerate(powers):
+                            if power != 0:
+                                if not start:
+                                    prod = x[:, :, [idx]] ** power
+                                    start = True
+
+                                else:
+                                    prod = prod * x[:, :, [idx]] ** power
+
+                        output = torch.cat((output, prod), dim=-1)
+
+            else:
+                output = x
+            
+            return output
+        
+
+class ConvVolterra(ConvLike, Volterra):
+    def __init__(self, in_channels, kernel_size, stride=1, dilation=1, order=1):
+        Volterra.__init__(self, order=order, memory=kernel_size * in_channels)
+        super().__init__(in_channels, kernel_size, stride, dilation)
+
+
+class ConvGRU(ConvLike, nn.GRU, Freeze):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, num_layers=1, bias=True, dropout=0.0, dtype=None):
+        nn.GRU.__init__(
+            self, input_size=in_channels * kernel_size, hidden_size=out_channels, num_layers=num_layers, 
+            bias=bias, batch_first=True, dropout=dropout, dtype=get_class(dtype)
+        )
+        super().__init__(in_channels, kernel_size, stride, dilation)
+        Freeze.__init__(self)
+
+    def forward(self, x):
+        x = self.unfold(x)
+        x, _ = nn.GRU.forward(self, x)
+        x = torch.transpose(x, -1, -2) # Put the channel dimension back in it's place 
+        return x
+    
+
+class Conv1d(nn.Conv1d, Freeze):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, bias=True, device=None, dtype=None):
+        super().__init__(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, dilation=dilation, bias=bias, device=device, dtype=get_class(dtype))
+        Freeze.__init__(self)
+
+
+class Activation(nn.Module, Freeze):
+    def __init__(self, offset=0., scale=1., offset_requires_grad=False, scale_requires_grad=False):
+        nn.Module.__init__(self)
+        self.offset = nn.Parameter(torch.tensor(offset), requires_grad=offset_requires_grad)
+        self.scale = nn.Parameter(torch.tensor(scale), requires_grad=scale_requires_grad)
+        Freeze.__init__(self)
+
+    def forward(self, x):
+        return self.scale * self.basis(x - self.offset)
+
+
+class BSpline(Activation):
+    def __init__(self, *args, degree=1, width=1, **kwargs):
+        Activation.__init__(self, *args, **kwargs)
+        self.degree = degree
+        self.width = width
+        self.register_buffer('helper_points', torch.linspace(0, self.degree * self.width, self.degree + 1))
+        
+    def basis(self, x):
+        # x has shape (B, Cin, N)
+        
+        # Read the Wikipedia article on B-splines using Cox-de Boor to understand the following
+        # We start by implementing x - t_i, and by our definition B_i,0(x) = {if 0 <= x - t_i < 1: 1, otherwise: 0}
+        # B_0,p(x) has a maxima at (self.degree + 1) * self.width / 2, thus we offset all points for the maxima to coincide with grid
+        # Float point precision may impact the result for x coinciding with the grid (x >= 0, x < self.width is not computed accurately everytime)
+        x = x + (self.degree + 1) * self.width / 2
+        x = x[..., None] - self.helper_points  # (B, Cin, N, G)
+        bn = torch.logical_and(x >= 0, x < self.width)
+
+        # Cox-de Boor formula
+        for k in range(self.degree):
+            bn = (x[..., :-(k + 1)] * bn[..., :-1] + ((k + 2) * self.width - x[..., :-(k + 1)]) * bn[..., 1:]) / ((k + 1) * self.width)  # The grid dimension gets smaller by one at each iteration
+
+        # Attention: for degree = 0, this function has no gradient
+        return bn.flatten(start_dim=-2)
+
     
 # Used to process the parameters of a torch.nn.Module
 def process_parameters(module, config, device='cpu', accumulate=False):
