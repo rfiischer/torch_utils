@@ -93,13 +93,13 @@ class ParallelNet(nn.Module):
 def hook_factory(x, surrogate, surrogate_is_grad=False):
     if surrogate_is_grad:
         def hook(grad):
-            x.backward(surrogate(x) * grad) # Only makes sense in the case a function is applied element-wise on x (Jacobian is then a diagonal)
+            x.backward(surrogate(x) * grad, retain_graph=True) # Only makes sense in the case a function is applied element-wise on x (Jacobian is then a diagonal)
 
     else:
         surrogate_output = surrogate(x)
 
         def hook(grad):
-            surrogate_output.backward(grad)
+            surrogate_output.backward(grad, retain_graph=True)
     
     return hook
 
