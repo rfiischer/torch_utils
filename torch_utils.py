@@ -440,6 +440,25 @@ class BSpline(Activation):
         return bn.flatten(start_dim=-2)
 
     
+class Step(Activation):
+    def __init__(self, *args, **kwargs):
+        Activation.__init__(self, *args, **kwargs)
+
+    def basis(self, x):
+        return (x >= 0).to(dtype=x.dtype)
+
+
+class ApproximateStep(Activation):
+    def __init__(self, width=1, *args, **kwargs):
+        Activation.__init__(self, *args, **kwargs)
+        self.width = width / 2
+
+    def basis(self, x):
+        return 1 / 2 * torch.logical_and(x >= -self.width, x < 0) * (x ** 2 / self.width ** 2 + 2 * x / self.width + 1) \
+            + 1 / 2 * torch.logical_and(x >= 0, x < self.width) * (-x ** 2 / self.width ** 2 + 2 * x / self.width + 1) \
+            + 1. * (x >= self.width)
+
+
 # Used to process the parameters of a torch.nn.Module
 def process_parameters(module, config, device='cpu', accumulate=False):
     """
