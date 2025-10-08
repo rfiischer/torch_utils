@@ -526,3 +526,480 @@ def entropy_reg(param, factor=0.1):
 
 def l1_reg(param, factor=0.1):
     return factor * torch.sum(torch.abs(param))
+
+
+def get_layers(**kwargs):
+    layers = OrderedDict()
+
+    if kwargs['model'] == 'volterra':
+        """
+        Parameters:
+        'n_orders':
+        'in_channels':
+        'out_channels':
+        'order_[i]_size':
+        'stride':
+        """
+        volterra = OrderedDict()
+        for order in range(1, kwargs['n_orders'] + 1):
+            volterra[f'order_{order}'] = {
+                'model': 'torch_utils.ConvVolterra',
+                'kwargs': {
+                    'in_channels': kwargs['in_channels'],
+                    'kernel_size': kwargs[f'order_{order}_size'],
+                    'stride': kwargs['stride'],
+                    'order': order
+                }
+            }
+        layers['layer_1'] = {
+            'model': 'torch_utils.ParallelConv',
+            'kwargs': {
+                'config': volterra,
+            }
+        }
+        layers['layer_2'] = {
+            'model': 'torch_utils.Conv1d',   # You can also use 'torch.nn.Conv1d', but this version also has a cost function
+            'kwargs': {
+                'in_channels': sum([num_volterra(order, kwargs[f'order_{order}_size'] * kwargs['in_channels']) for order in range(1, kwargs['n_orders'] + 1)]),
+                'out_channels': kwargs['out_channels'],
+                'kernel_size': 1,   # kernel_size and stride are set to one since we just want to sum across the channel dimensions 
+                'stride': 1
+            }
+        }
+        
+    elif kwargs['model'] == 'multi_volterra':
+        """
+        Parameters:
+        'n_layers':
+        'in_channels':
+        'out_channels':
+        'n_orders_[i]':
+        'hidden_channels_[i]':
+        'order_[j]_size_[i]':
+        'stride_[i]':
+        """
+        for layer_idx in range(1, kwargs['n_layers'] + 1):
+            layers[f'layer_{layer_idx}'] = {
+                'model': 'torch_utils.SequentialConv',
+                'kwargs': {
+                    'config': get_layers(
+                        model='volterra',
+                        **{
+                            'n_orders': kwargs[f'n_orders_{layer_idx}'],
+                            'in_channels': kwargs['in_channels'] if layer_idx == 1 else kwargs[f'hidden_channels_{layer_idx - 1}'],
+                            'out_channels': kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+                            'stride': kwargs[f'stride_{layer_idx}'],
+                            **{f'order_{order}_size': kwargs[f'order_{order}_size_{layer_idx}'] for order in range(1, kwargs[f'n_orders_{layer_idx}'] + 1)}
+                        }
+                    )
+                }
+            }
+        
+    elif kwargs['model'] == 'gru':
+        """
+        Parameters:
+        'n_layers':
+        'in_channels':
+        'out_channels':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        'num_layers_[i]':
+        """
+        for gru_idx in range(1, kwargs['n_layers'] + 1):
+            layers[f'layer_{gru_idx}'] = {
+                'model': 'torch_utils.ConvGRU',
+                'kwargs': {
+                    'in_channels': kwargs['in_channels'] if gru_idx == 1 else kwargs[f'hidden_channels_{gru_idx - 1}'],
+                    'out_channels': kwargs[f'hidden_channels_{gru_idx}'],
+                    'kernel_size': kwargs[f'kernel_size_{gru_idx}'],
+                    'stride': kwargs[f'stride_{gru_idx}'],
+                    'num_layers': kwargs[f'num_layers_{gru_idx}']
+                }
+            }
+        layers[f'layer_{kwargs["n_layers"] + 1}'] = {
+            'model': 'torch_utils.Conv1d',
+            'kwargs': {
+                'in_channels': kwargs[f'hidden_channels_{kwargs["n_layers"]}'],
+                'out_channels': kwargs['out_channels'],
+                'kernel_size': 1,
+                'stride': 1,
+            }
+        }
+        
+    elif kwargs['model'] == 'conv':
+        """
+        Parameters:
+        'n_layers':
+        'in_channels':
+        'out_channels':
+        'activation':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        """
+        layers['layer_1'] = {
+            'model': 'torch_utils.Conv1d',
+            'kwargs': {
+                'in_channels': kwargs['in_channels'],
+                'out_channels': kwargs['hidden_channels_1'],
+                'kernel_size': kwargs['kernel_size_1'],
+                'stride': kwargs['stride_1'],
+            }
+        }
+        for layer_idx in range(1, kwargs['n_layers']):
+            layers[f'layer_{layer_idx}_act'] = {
+                'model': kwargs['activation'],
+                'kwargs': {}
+            }
+            layers[f'layer_{layer_idx + 1}'] = {
+                'model': 'torch_utils.Conv1d',
+                'kwargs': {
+                    'in_channels': kwargs[f'hidden_channels_{layer_idx}'],
+                    'out_channels': kwargs['out_channels'] if layer_idx == kwargs['n_layers'] - 1 else kwargs[f'hidden_channels_{layer_idx + 1}'],
+                    'kernel_size': kwargs[f'kernel_size_{layer_idx + 1}'],
+                    'stride': kwargs[f'stride_{layer_idx + 1}'],
+                }
+            }
+        
+    elif kwargs['model'] == 'spline_kan':
+        """
+        Parameters:
+        'grid_size':
+        'grid_min':
+        'grid_max':
+        'degree':
+        'width':
+        'in_channels':
+        'out_channels':
+        'kernel_size':
+        'stride':
+        """
+        branches = OrderedDict()
+        for grid_idx in range(kwargs['grid_size']):
+            branch_layers = OrderedDict()
+            branch_layers[f'layer_1'] = {
+                'model': 'torch_utils.BSpline',
+                'kwargs': {
+                    'offset': kwargs['grid_min'] + grid_idx / (kwargs['grid_size'] - 1) * (kwargs['grid_max'] - kwargs['grid_min']),
+                    'degree': kwargs['degree'],
+                    'width': kwargs['width']
+                }
+            }
+            branch_layers[f'layer_2'] = {
+                'model': 'torch_utils.Conv1d',
+                'kwargs': {
+                    'in_channels': kwargs['in_channels'],
+                    'out_channels': kwargs['out_channels'],
+                    'kernel_size': kwargs['kernel_size'],
+                    'stride': kwargs['stride']
+                }
+            }
+            branches[f'point_{grid_idx}'] = {
+                'model': 'torch_utils.SequentialConv',
+                'kwargs': {'config': branch_layers}
+            }
+        layers['layer_1'] = {
+            'model': 'torch_utils.ParallelConv',
+            'kwargs': {
+                'config': branches,
+                'mode': 'sum',
+            }
+        }
+        
+    elif kwargs['model'] == 'multi_spline_kan':
+        """
+        Parameters:
+        'n_layers':
+        'grid_size':
+        'grid_min':
+        'grid_max':
+        'width':
+        'degree':
+        'in_channels':
+        'out_channels':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        """
+        for layer_idx in range(1, kwargs['n_layers'] + 1):
+            layers[f'layer_{layer_idx}'] = get_layers(
+                model='spline_kan',
+                grid_size=kwargs['grid_size'], grid_min=kwargs['grid_min'], grid_max=kwargs['grid_max'],
+                degree=kwargs['degree'],
+                width=kwargs['width'],
+                in_channels=kwargs['in_channels'] if layer_idx == 1 else kwargs[f'hidden_channels_{layer_idx - 1}'],
+                out_channels=kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+                kernel_size=kwargs[f'kernel_size_{layer_idx}'],
+                stride=kwargs[f'stride_{layer_idx}'],
+            )['layer_1']
+
+    elif kwargs['model'] == 'multi_default_kan':
+        """
+        Parameters:
+        'n_layers':
+        'grid_size':
+        'grid_min':
+        'grid_max':
+        'width':
+        'in_channels':
+        'out_channels':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        """
+        for layer_idx in range(1, kwargs['n_layers'] + 1):
+            parallel = OrderedDict()
+            sequential = OrderedDict()
+            parallel['layer_1'] = get_layers(
+                model='spline_kan',
+                grid_size=kwargs['grid_size'], grid_min=kwargs['grid_min'], grid_max=kwargs['grid_max'],
+                degree=2,
+                width=kwargs['width'],
+                in_channels=kwargs['in_channels'] if layer_idx == 1 else kwargs[f'hidden_channels_{layer_idx - 1}'],
+                out_channels=kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+                kernel_size=kwargs[f'kernel_size_{layer_idx}'],
+                stride=kwargs[f'stride_{layer_idx}'],
+            )['layer_1']
+            sequential['layer_1'] = {
+                'model': 'torch.nn.SiLU',
+                'kwargs': {}
+            }
+            sequential['layer_2'] = {
+                'model': 'torch_utils.Conv1d',
+                'kwargs': {
+                    'in_channels': kwargs['in_channels'] if layer_idx == 1 else kwargs[f'hidden_channels_{layer_idx - 1}'],
+                    'out_channels': kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+                    'kernel_size': kwargs[f'kernel_size_{layer_idx}'],
+                    'stride': kwargs[f'stride_{layer_idx}'],
+                }
+            }
+            parallel['layer_2'] = {
+                'model': 'torch_utils.SequentialConv',
+                'kwargs': {'config': sequential}
+            }
+            layers[f'layer_{layer_idx}'] = {
+                'model': 'torch_utils.ParallelConv',
+                'kwargs': {
+                    'config': parallel,
+                    'mode': sum,
+                }
+            }
+    
+    elif kwargs['model'] == 'res_relu':
+        """
+        Parameters:
+        'in_channels':
+        'out_channels':
+        'kernel_size':
+        'stride':
+        """
+        branches = OrderedDict()
+        branch_1 = OrderedDict()
+        branch_2 = OrderedDict()
+        branch_1['layer_1'] = {
+            'model': 'torch.nn.Identity',
+            'kwargs': {}
+        }
+        branch_1['layer_2'] = {
+            'model': 'torch_utils.Conv1d',
+            'kwargs': {
+                'in_channels': kwargs['in_channels'],
+                'out_channels': kwargs['out_channels'],
+                'kernel_size': kwargs['kernel_size'],
+                'stride': kwargs['stride']
+            }
+        }
+        branch_2['layer_1'] = {
+            'model': 'torch.nn.ReLU',
+            'kwargs': {}
+        }
+        branch_2['layer_2'] = {
+            'model': 'torch_utils.Conv1d',
+            'kwargs': {
+                'in_channels': kwargs['in_channels'],
+                'out_channels': kwargs['out_channels'],
+                'kernel_size': kwargs['kernel_size'],
+                'stride': kwargs['stride']
+            }
+        }
+        branches['layer_1'] = {
+            'model': 'torch_utils.SequentialConv',
+            'kwargs': {'config': branch_1}
+        }
+        branches['layer_2'] = {
+            'model': 'torch_utils.SequentialConv',
+            'kwargs': {'config': branch_2}
+        }
+        layers['layer_1'] = {
+            'model': 'torch_utils.ParallelConv',
+            'kwargs': {
+                'config': branches,
+                'mode': 'sum',
+            }
+        }
+        
+    elif kwargs['model'] == 'multi_res_relu':
+        """
+        Parameters:
+        'n_layers':
+        'in_channels':
+        'out_channels':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        """
+        for layer_idx in range(1, kwargs['n_layers'] + 1):
+            layers[f'layer_{layer_idx}'] = get_layers(
+                model='res_relu',
+                in_channels=kwargs['in_channels'] if layer_idx == 1 else kwargs[f'hidden_channels_{layer_idx - 1}'],
+                out_channels=kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+                kernel_size=kwargs[f'kernel_size_{layer_idx}'],
+                stride=kwargs[f'stride_{layer_idx}'],
+            )['layer_1']
+        
+    elif kwargs['model'] == 'multi_res_relu_lin':
+        """
+        Parameters:
+        'n_layers':
+        'in_channels':
+        'out_channels':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        """
+        layers['layer_1'] = {
+            'model': 'torch_utils.Conv1d',
+            'kwargs': {
+                'in_channels': kwargs['in_channels'],
+                'out_channels': kwargs['hidden_channels_1'],
+                'kernel_size': kwargs['kernel_size_1'],
+                'stride': kwargs['stride_1']
+            }
+        }
+        for layer_idx in range(2, kwargs['n_layers'] + 1):
+            layers[f'layer_{layer_idx}'] = get_layers(
+                model='res_relu',
+                in_channels=kwargs[f'hidden_channels_{layer_idx - 1}'],
+                kernel_size=kwargs[f'kernel_size_{layer_idx}'],
+                stride=kwargs[f'stride_{layer_idx}'],
+                out_channels=kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+            )['layer_1']
+            
+    elif kwargs['model'] == 'rect':
+        """
+        Parameters:
+        'in_channels':
+        'offset':
+        'width':
+        'grad_width':
+        """
+        rect = OrderedDict()
+        surrogate = OrderedDict()
+        rect['layer_1'] = {
+            'model': 'torch_utils.BSpline',
+            'kwargs': {
+                'offset': kwargs['offset'],
+                'degree': 0,
+                'width': kwargs['width'],
+            }
+        }
+        surrogate['layer_1'] = {
+            'model': 'torch_utils.BSpline',
+            'kwargs': {
+                'offset': kwargs['offset'] - kwargs['width'] / 2,
+                'degree': 1,
+                'width': kwargs['grad_width'],
+                'scale': 1 / kwargs['grad_width']
+            }
+        }
+        surrogate['layer_2'] = {
+            'model': 'torch_utils.BSpline',
+            'kwargs': {
+                'offset': kwargs['offset'] + kwargs['width'] / 2,
+                'degree': 1,
+                'width': kwargs['grad_width'],
+                'scale': - 1 / kwargs['grad_width']
+            }
+        }
+        rect['layer_2'] = {
+            'model': 'torch_utils.ParallelConv',
+            'kwargs': {'config': surrogate, 'mode': 'sum'}
+        }
+        layers['layer_1'] = {
+            'model': 'torch_utils.SurrogateConv',
+            'kwargs': {'config': rect, 'clone_model': False, 'surrogate_is_grad': True}
+        }
+        
+    elif kwargs['model'] == 'rect_kan':
+        """
+        Parameters:
+        'grid_size':
+        'grid_min':
+        'grid_max':
+        'width':
+        'grad_width':
+        'in_channels':
+        'out_channels':
+        'kernel_size':
+        'stride':
+        """
+        branches = OrderedDict()
+        for grid_idx in range(kwargs['grid_size']):
+            branch_layers = OrderedDict()
+            branch_layers[f'layer_1'] = get_layers(
+                model='rect',
+                in_channels=kwargs['in_channels'],
+                offset=kwargs['grid_min'] + grid_idx / (kwargs['grid_size'] - 1) * (kwargs['grid_max'] - kwargs['grid_min']),
+                width=kwargs['width'],
+                grad_width=kwargs['grad_width']
+            )['layer_1']      
+            branch_layers[f'layer_2'] = {        
+                'model': 'torch_utils.Conv1d',
+                'kwargs': {
+                    'in_channels': kwargs['in_channels'],
+                    'out_channels': kwargs['out_channels'],
+                    'kernel_size': kwargs['kernel_size'],
+                    'stride': kwargs['stride']
+                }
+            }
+            branches[f'point_{grid_idx}'] = {
+                'model': 'torch_utils.SequentialConv',
+                'kwargs': {'config': branch_layers}
+            }
+        layers['layer_1'] = {
+            'model': 'torch_utils.ParallelConv',
+            'kwargs': {
+                'config': branches,
+                'mode': 'sum',
+            }
+        }
+        
+    elif kwargs['model'] == 'multi_rect_kan':
+        """
+        Parameters:
+        'n_layers':
+        'grid_size':
+        'grid_min':
+        'grid_max':
+        'width':
+        'grad_width':
+        'in_channels':
+        'out_channels':
+        'hidden_channels_[i]':
+        'kernel_size_[i]':
+        'stride_[i]':
+        """
+        for layer_idx in range(1, kwargs['n_layers'] + 1):
+            layers[f'layer_{layer_idx}'] = get_layers(
+                model='rect_kan',
+                grid_size=kwargs['grid_size'], grid_min=kwargs['grid_min'], grid_max=kwargs['grid_max'],
+                width=kwargs['width'],
+                grad_width=kwargs['grad_width'],
+                in_channels=kwargs['in_channels'] if layer_idx == 1 else kwargs[f'hidden_channels_{layer_idx - 1}'],
+                out_channels=kwargs['out_channels'] if layer_idx == kwargs['n_layers'] else kwargs[f'hidden_channels_{layer_idx}'],
+                kernel_size=kwargs[f'kernel_size_{layer_idx}'],
+                stride=kwargs[f'stride_{layer_idx}'],
+            )['layer_1']
+
+    return layers
