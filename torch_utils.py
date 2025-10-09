@@ -6,6 +6,7 @@ import operator
 from itertools import accumulate
 import numpy as np
 from itertools import combinations
+from math import prod
 
 from .utils import get_class, num_volterra
 
@@ -411,7 +412,41 @@ class Activation(nn.Module, Freeze):
         Freeze.__init__(self)
 
     def forward(self, x):
-        return self.scale * self.basis(x - self.offset)
+        if self.offset.ndim == 0:
+            return self.scale * self.basis(x - self.offset)
+        else:
+            return (self.scale * self.basis(x[..., None] - self.offset)).movedim(-1, 1).flatten(1, 2)
+        
+
+class GaussianPDF(nn.Module):
+    def __init__(self, dims, n_kernels):
+        nn.Module.__init__(self)
+        self.dims = dims
+        self.n_kernels = n_kernels
+        
+    def forward(self, x, weights, mean, var):
+        ndim = prod([x.shape[i] for i in self.dims])
+
+        mean_shape = [1] * (x.ndim + 1)
+        for d_idx in self.dims:
+            mean_shape[d_idx] = x.shape[d_idx]
+        mean_shape[-1] = self.n_kernels 
+        mean_shape[0] = mean.shape[0]
+        mean = mean.view(*mean_shape)
+
+        weights_shape = [1] * (x.ndim)
+        weights_shape[0] = weights.shape[0]
+        weights_shape[-1] = weights.shape[-1]
+        weights = weights.view(*weights_shape)
+
+        var_shape = [1] * (x.ndim)
+        var_shape[0] = var.shape[0]
+        var = var.view(*var_shape)
+        return  torch.sum(
+            weights * torch.exp(
+                -torch.sum(torch.abs(x[..., None] - mean) ** 2, dim=self.dims) / (2 * var)
+            ) / (2 * np.pi * var) ** (ndim / 2), dim=-1
+        )
 
 
 class BSpline(Activation):
