@@ -418,7 +418,7 @@ class Activation(nn.Module, Freeze):
             return (self.scale * self.basis(x[..., None] - self.offset)).movedim(-1, 1).flatten(1, 2)
         
 
-class GaussianPDF(nn.Module):
+class GaussianMixturePDF(nn.Module):
     def __init__(self, dims, n_kernels):
         nn.Module.__init__(self)
         self.dims = dims
