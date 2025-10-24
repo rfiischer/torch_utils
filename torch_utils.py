@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import re 
 from collections import OrderedDict
 import operator
@@ -419,34 +420,82 @@ class Activation(nn.Module, Freeze):
         
 
 class GaussianMixturePDF(nn.Module):
-    def __init__(self, dims, n_kernels):
+    def __init__(self, dim, n_kernels):
         nn.Module.__init__(self)
-        self.dims = dims
+        self.dim = dim
         self.n_kernels = n_kernels
         
-    def forward(self, x, weights, mean, var):
-        ndim = prod([x.shape[i] for i in self.dims])
+    def forward(self, x, params):
+        n_dim = x.shape[self.dim]
+        
+        weight, mean, var = self.separate_params(params)
+        
+        weight = self.reshape(x.shape, weight, False)
+        mean = self.reshape(x.shape, mean, True)
+        var = self.reshape(x.shape, var, False)
 
-        mean_shape = [1] * (x.ndim + 1)
-        for d_idx in self.dims:
-            mean_shape[d_idx] = x.shape[d_idx]
-        mean_shape[-1] = self.n_kernels 
-        mean_shape[0] = mean.shape[0]
-        mean = mean.view(*mean_shape)
-
-        weights_shape = [1] * (x.ndim)
-        weights_shape[0] = weights.shape[0]
-        weights_shape[-1] = weights.shape[-1]
-        weights = weights.view(*weights_shape)
-
-        var_shape = [1] * (x.ndim)
-        var_shape[0] = var.shape[0]
-        var = var.view(*var_shape)
         return  torch.sum(
-            weights * torch.exp(
-                -torch.sum(torch.abs(x[..., None] - mean) ** 2, dim=self.dims) / (2 * var)
-            ) / (2 * np.pi * var) ** (ndim / 2), dim=-1
+            weight * torch.exp(
+                -torch.sum(torch.abs(x[..., None] - mean) ** 2, dim=self.dim) / (2 * var)
+            ) / (2 * np.pi * var) ** (n_dim / 2), dim=-1
         )
+
+    def separate_params(self, params):
+        # Split parameters
+        log_weight = params[..., :self.n_kernels]
+        mean = params[..., self.n_kernels:-1]
+        log_var = params[..., -1:]
+
+        # Compute probabilities and variance
+        weight = F.softmax(log_weight, dim=-1)
+        var = torch.exp(log_var)
+        
+        return weight, mean, var
+    
+    def reshape(self, size, tensor, is_mean=True, copy=True):
+        total_dim = len(size)
+        if is_mean:
+            shape = [1] * (total_dim + 1)
+            if copy:
+                shape[self.dim] = size[self.dim]
+            shape[-1] = -1
+            shape[0] = tensor.shape[0]
+            tensor = tensor.view(*shape)
+            
+        else:
+            shape = [1] * (total_dim)
+            shape[0] = tensor.shape[0]
+            shape[-1] = tensor.shape[-1]
+            tensor = tensor.view(*shape)
+        
+        return tensor
+
+    def sample(self, size, params):
+        # Split parameters
+        weight, mean, var = self.separate_params(params)
+        var = self.reshape(size, var, False)
+
+        # Number of samples
+        num_samples = prod(size) // size[self.dim] // weight.shape[0]
+
+        # Draw mixture component indices
+        comp_idx = torch.multinomial(weight, num_samples=num_samples, replacement=True)
+        mean = self.reshape(size, mean, True)
+        comp_idx = self.reshape(size, comp_idx, True, False).expand(-1, *mean.shape[1:-1], -1)
+
+        # Gather selected means
+        chosen_means = torch.gather(mean, -1, comp_idx).transpose(self.dim, 0)
+        comp_idx = comp_idx.transpose(self.dim, 0)
+
+        # Sample from corresponding Gaussian
+        eps = torch.randn_like(chosen_means)
+        samples = chosen_means + eps * torch.sqrt(var)
+        
+        # Reshape
+        samples = samples.reshape(size[self.dim], *size[:self.dim], *size[self.dim+1:]).transpose(self.dim, 0)
+        comp_idx = comp_idx.reshape(size[self.dim], *size[:self.dim], *size[self.dim+1:]).transpose(self.dim, 0)
+
+        return samples, comp_idx, weight
 
 
 class BSpline(Activation):
