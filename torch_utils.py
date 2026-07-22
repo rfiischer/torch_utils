@@ -12,35 +12,6 @@ from math import prod
 from .utils import get_class, num_volterra
 
 
-class Freeze:
-    """
-    Subclass this to enable parameter freezing
-    """
-    def __init__(self):
-        self.mask_dict = {name: torch.zeros(parameter.shape, dtype=bool) for name, parameter in self.named_parameters()}
-
-    def freeze(self, name, mask):
-        """
-        Freezes (sets to zero and deactivate the gradients) the weights indicated by a mask
-        """
-
-        param_dict = dict(self.named_parameters())
-
-        with torch.no_grad():
-            self.mask_dict[name] = torch.logical_or(torch.as_tensor(mask), self.mask_dict[name])
-            param_dict[name][self.mask_dict[name]] = 0
-
-        def zero_grad(grad):
-            # Use mask to zero-out the gradient without in-place modification 
-            mask = torch.ones_like(grad)
-            mask[self.mask_dict[name]] = 0
-            return grad * mask
-
-        # If freezing is done within torch.no_grad, then no hook is created 
-        if param_dict[name].requires_grad:
-            param_dict[name].register_hook(zero_grad)
-            
-
 class SequentialNet(nn.Sequential):
     """
     Creates a torch.nn.Sequential network using a config dict as input
@@ -217,10 +188,7 @@ def get_padding(module, ndim=1):
     """
     Computes the padding necessary to have an output of L / s, where L is the sequence size and s is the stride, of a convolution layer, assuming L is divisible by s. A negative right padding means that for the last stride the kernel doesn't cover the entire input
     """
-    if hasattr(module, 'get_padding'):
-        return module.get_padding()
-    
-    elif hasattr(module, 'kernel_size') and hasattr(module, 'stride') and hasattr(module, 'dilation'):
+    if hasattr(module, 'kernel_size') and hasattr(module, 'stride') and hasattr(module, 'dilation'):
         kernel_size = module.kernel_size
         stride = module.stride
         dilation = module.dilation
@@ -230,15 +198,15 @@ def get_padding(module, ndim=1):
                 for p in ((e_size - 1) // 2, e_size - (e_size - 1) // 2 - stride)    # Left and right padding for each dimension 
             )
 
+    elif hasattr(module, 'padding'):
+        return module.padding
+
     else:
         return (0,) * (2 * ndim)
 
 
 def get_stride(module, ndim=1):
-    if hasattr(module, 'get_stride'):
-        return module.get_stride()
-    
-    elif hasattr(module, 'stride'):
+    if hasattr(module, 'stride'):
         return module.stride
     
     else:
@@ -252,30 +220,41 @@ class SequentialConv(SequentialNet):
     def __init__(self, *args, ndim=1, **kwargs):
         SequentialNet.__init__(self, *args, **kwargs)
         self.ndim = ndim
+        self._padding = None
+        self._stride = None
 
-    def get_padding(self):
-        padding = (0,) * (2 * self.ndim)
+    @property
+    def padding(self):
+        if self._padding is None:
+            padding = (0,) * (2 * self.ndim)
 
-        layer_list = list(self.children())
+            layer_list = list(self.children())
 
-        for layer in layer_list[::-1]:
-            own_padding = get_padding(layer, self.ndim)
-            stride = get_stride(layer, self.ndim)
-            padding = tuple(
-                p for dim_idx, (l, r) in enumerate(zip(padding[::2], padding[1::2]))
-                    for p in (
-                        l * stride[dim_idx] + own_padding[2 * dim_idx],
-                        r * stride[dim_idx] + own_padding[2 * dim_idx + 1]
+            for layer in layer_list[::-1]:
+                own_padding = get_padding(layer, self.ndim)
+                stride = get_stride(layer, self.ndim)
+                padding = tuple(
+                    p for dim_idx, (l, r) in enumerate(zip(padding[::2], padding[1::2]))
+                        for p in (
+                            l * stride[dim_idx] + own_padding[2 * dim_idx],
+                            r * stride[dim_idx] + own_padding[2 * dim_idx + 1]
+                        )
                     )
-                )
 
-        return padding
+            return padding
+        
+        else: 
+            return self._padding
     
-    def get_stride(self):
-        stride = (1,) * self.ndim
-        for layer in self.children():
-            own_stride = get_stride(layer)
-            stride = tuple(x * y for x, y in zip(stride, own_stride))
+    @property
+    def stride(self):
+        if self._stride is None:
+            stride = (1,) * self.ndim
+            for layer in self.children():
+                own_stride = get_stride(layer)
+                stride = tuple(x * y for x, y in zip(stride, own_stride))
+        else:
+            stride = self._stride
         
         return stride
     
@@ -285,27 +264,37 @@ class ParallelConv(ParallelNet):
         ParallelNet.__init__(self, *args, **kwargs)
         self.ndim = ndim
         self.padding_list = []
-        self.padding = None
+        self._padding = None
         self.padding_slices = []
+        self._stride = None
 
-    def get_padding(self):
-        for layer in self.children():
-            own_padding = get_padding(layer, ndim=self.ndim)
-            self.padding_list.append(own_padding)
+    @property
+    def padding(self):
+        if self._padding is None:
+            for layer in self.children():
+                own_padding = get_padding(layer, ndim=self.ndim)
+                self.padding_list.append(own_padding)
+        
+            self._padding = (max([x[0] for x in self.padding_list]), max([x[1] for x in self.padding_list]))
+
+            for branch_padding in self.padding_list:
+                slice_list = [...]
+                for dim_idx in range(len(branch_padding) // 2):
+                    slice_list.append(slice(self._padding[0] - branch_padding[2 * dim_idx], -(self._padding[1] - branch_padding[2 * dim_idx + 1]) or None))
+                
+                self.padding_slices.append(slice_list)
+
+            return self._padding
+        
+        else:
+            return self._padding
     
-        self.padding = (max([x[0] for x in self.padding_list]), max([x[1] for x in self.padding_list]))
-
-        for branch_padding in self.padding_list:
-            slice_list = [...]
-            for dim_idx in range(len(branch_padding) // 2):
-                slice_list.append(slice(self.padding[0] - branch_padding[2 * dim_idx], -(self.padding[1] - branch_padding[2 * dim_idx + 1]) or None))
-            
-            self.padding_slices.append(slice_list)
-
-        return self.padding
-    
-    def get_stride(self):
-        return get_stride(self._branches[0][0])
+    @property
+    def stride(self):
+        if self._stride is None:
+            return get_stride(self._branches[0][0])
+        else:
+            return self._stride
     
     def forward(self, x):
         outputs = []
@@ -323,13 +312,22 @@ class SurrogateConv(SurrogateNet):
     def __init__(self, *args, ndim=1, **kwargs):
         SurrogateNet.__init__(self, *args, **kwargs)
         self.ndim = ndim
+        self._padding = None
+        self._stride = None
     
-    def get_padding(self):
-        get_padding(self.surrogate, ndim=self.ndim)
-        return get_padding(self.main, ndim=self.ndim)
-    
-    def get_stride(self):
-        return get_stride(self.main, self.ndim)
+    @property
+    def padding(self):
+        if self._padding is None:
+            return get_padding(self.main, ndim=self.ndim)
+        else:
+            return self._padding
+
+    @property
+    def stride(self):
+        if self._stride is None:
+            return get_stride(self.main, ndim=self.ndim)
+        else:
+            return self._stride
             
 
 class Volterra(nn.Module):
@@ -383,14 +381,13 @@ class ConvVolterra(ConvLike, Volterra):
         super().__init__(in_channels, kernel_size, stride, dilation)
 
 
-class ConvGRU(ConvLike, nn.GRU, Freeze):
+class ConvGRU(ConvLike, nn.GRU):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, num_layers=1, bias=True, dropout=0.0, dtype=None):
         nn.GRU.__init__(
             self, input_size=in_channels * kernel_size, hidden_size=out_channels, num_layers=num_layers, 
             bias=bias, batch_first=True, dropout=dropout, dtype=get_class(dtype)
         )
         super().__init__(in_channels, kernel_size, stride, dilation)
-        Freeze.__init__(self)
 
     def forward(self, x):
         x = self.unfold(x)
@@ -399,18 +396,11 @@ class ConvGRU(ConvLike, nn.GRU, Freeze):
         return x
     
 
-class Conv1d(nn.Conv1d, Freeze):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, bias=True, device=None, dtype=None):
-        super().__init__(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, dilation=dilation, bias=bias, device=device, dtype=get_class(dtype))
-        Freeze.__init__(self)
-
-
-class Activation(nn.Module, Freeze):
+class Activation(nn.Module):
     def __init__(self, offset=0., scale=1., offset_requires_grad=False, scale_requires_grad=False):
         nn.Module.__init__(self)
         self.offset = nn.Parameter(torch.tensor(offset), requires_grad=offset_requires_grad)
         self.scale = nn.Parameter(torch.tensor(scale), requires_grad=scale_requires_grad)
-        Freeze.__init__(self)
 
     def forward(self, x):
         if self.offset.ndim == 0:
@@ -418,85 +408,6 @@ class Activation(nn.Module, Freeze):
         else:
             return (self.scale * self.basis(x[..., None] - self.offset)).movedim(-1, 1).flatten(1, 2)
         
-
-class GaussianMixturePDF(nn.Module):
-    def __init__(self, dim, n_kernels):
-        nn.Module.__init__(self)
-        self.dim = dim
-        self.n_kernels = n_kernels
-        
-    def forward(self, x, params):
-        n_dim = x.shape[self.dim]
-        
-        weight, mean, var = self.separate_params(params)
-        
-        weight = self.reshape(x.shape, weight, False)
-        mean = self.reshape(x.shape, mean, True)
-        var = self.reshape(x.shape, var, False)
-
-        return  torch.sum(
-            weight * torch.exp(
-                -torch.sum(torch.abs(x[..., None] - mean) ** 2, dim=self.dim) / (2 * var)
-            ) / (2 * np.pi * var) ** (n_dim / 2), dim=-1
-        )
-
-    def separate_params(self, params):
-        # Split parameters
-        log_weight = params[..., :self.n_kernels]
-        mean = params[..., self.n_kernels:-1]
-        log_var = params[..., -1:]
-
-        # Compute probabilities and variance
-        weight = F.softmax(log_weight, dim=-1)
-        var = torch.exp(log_var)
-        
-        return weight, mean, var
-    
-    def reshape(self, size, tensor, is_mean=True, copy=True):
-        total_dim = len(size)
-        if is_mean:
-            shape = [1] * (total_dim + 1)
-            if copy:
-                shape[self.dim] = size[self.dim]
-            shape[-1] = -1
-            shape[0] = tensor.shape[0]
-            tensor = tensor.view(*shape)
-            
-        else:
-            shape = [1] * (total_dim)
-            shape[0] = tensor.shape[0]
-            shape[-1] = tensor.shape[-1]
-            tensor = tensor.view(*shape)
-        
-        return tensor
-
-    def sample(self, size, params):
-        # Split parameters
-        weight, mean, var = self.separate_params(params)
-        var = self.reshape(size, var, False)
-
-        # Number of samples
-        num_samples = prod(size) // size[self.dim] // weight.shape[0]
-
-        # Draw mixture component indices
-        comp_idx = torch.multinomial(weight, num_samples=num_samples, replacement=True)
-        mean = self.reshape(size, mean, True)
-        comp_idx = self.reshape(size, comp_idx, True, False).expand(-1, *mean.shape[1:-1], -1)
-
-        # Gather selected means
-        chosen_means = torch.gather(mean, -1, comp_idx).transpose(self.dim, 0)
-        comp_idx = comp_idx.transpose(self.dim, 0)
-
-        # Sample from corresponding Gaussian
-        eps = torch.randn_like(chosen_means)
-        samples = chosen_means + eps * torch.sqrt(var)
-        
-        # Reshape
-        samples = samples.reshape(size[self.dim], *size[:self.dim], *size[self.dim+1:]).transpose(self.dim, 0)
-        comp_idx = comp_idx.reshape(size[self.dim], *size[:self.dim], *size[self.dim+1:]).transpose(self.dim, 0)
-
-        return samples, comp_idx, weight
-
 
 class BSpline(Activation):
     def __init__(self, *args, degree=1, width=1, **kwargs):
@@ -598,6 +509,18 @@ def memory_size(model, keywords=('weight', 'bias')):
 
     return memory
 
+def memory_size(model, keywords=('weight', 'bias'), full=True):
+    memory = {keyword: 0 for keyword in keywords}
+    memory['other'] = 0
+    for layer in model.children():
+        for name, param in layer.named_parameters():
+            for keyword in keywords:
+                if keyword in name:
+                    memory[keyword] += (param.numel() if full else torch.sum(param != 0).item()) * param.element_size()
+                else:
+                    memory['other'] += (param.numel() if full else torch.sum(param != 0).item()) * param.element_size()
+
+    return memory
 
 def entropy_reg(param, factor=0.1):
     param = torch.abs(param)
