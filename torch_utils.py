@@ -1,15 +1,13 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import re 
 from collections import OrderedDict
 import operator
 from itertools import accumulate
 import numpy as np
 from itertools import combinations
-from math import prod
 
-from .utils import get_class, num_volterra
+from .utils.utils import get_class, num_volterra
 
 
 class SequentialNet(nn.Sequential):
