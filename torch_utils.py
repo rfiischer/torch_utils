@@ -514,11 +514,14 @@ def memory_size(model, keywords=('weight', 'bias'), full=True):
     memory['other'] = 0
     for layer in model.children():
         for name, param in layer.named_parameters():
+            keyword_found = False
             for keyword in keywords:
-                if keyword in name:
+                if keyword in name and not keyword_found:
                     memory[keyword] += (param.numel() if full else torch.sum(param != 0).item()) * param.element_size()
-                else:
-                    memory['other'] += (param.numel() if full else torch.sum(param != 0).item()) * param.element_size()
+                    keyword_found = True
+
+            if not keyword_found:
+                memory['other'] += (param.numel() if full else torch.sum(param != 0).item()) * param.element_size()
 
     return memory
 
